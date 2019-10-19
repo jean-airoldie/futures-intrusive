@@ -1,15 +1,25 @@
 //! An asynchronously awaitable semaphore for synchronization between concurrently
 //! executing futures.
 
-use futures_core::future::{Future, FusedFuture};
-use futures_core::task::{Context, Poll, Waker};
+use crate::{
+    intrusive_singly_linked_list::{LinkedList, ListNode},
+    waker::RWaker,
+};
+use abi_stable::{
+    external_types::parking_lot::RMutex,
+    std_types::{
+        RArc,
+        ROption::{self, *},
+    },
+    StableAbi,
+};
 use core::pin::Pin;
-use lock_api::{RawMutex, Mutex as LockApiMutex};
-use crate::NoopLock;
-use crate::intrusive_singly_linked_list::{LinkedList, ListNode};
+use futures_core::future::{FusedFuture, Future};
+use futures_core::task::{Context, Poll};
 
 /// Tracks how the future had interacted with the semaphore
-#[derive(PartialEq)]
+#[derive(PartialEq, StableAbi, Debug, Copy, Clone)]
+#[repr(u8)]
 enum PollState {
     /// The task has never interacted with the semaphore.
     New,
@@ -21,12 +31,17 @@ enum PollState {
     Notified,
     /// The task had been polled to completion.
     Done,
+    /// The semaphore was closed because the task could be polled to
+    /// completion.
+    Cancelled,
 }
 
 /// Tracks the SemaphoreAcquireFuture waiting state.
+#[derive(StableAbi)]
+#[repr(C)]
 struct WaitQueueEntry {
     /// The task handle of the waiting task
-    task: Option<Waker>,
+    task: ROption<RWaker>,
     /// Current polling state
     state: PollState,
     /// The amount of permits that should be obtained
@@ -37,7 +52,7 @@ impl WaitQueueEntry {
     /// Creates a new WaitQueueEntry
     fn new(required_permits: usize) -> WaitQueueEntry {
         WaitQueueEntry {
-            task: None,
+            task: RNone,
             state: PollState::New,
             required_permits,
         }
@@ -45,8 +60,11 @@ impl WaitQueueEntry {
 }
 
 /// Internal state of the `Semaphore`
+#[derive(StableAbi)]
+#[repr(C)]
 struct SemaphoreState {
     is_fair: bool,
+    is_closed: bool,
     permits: usize,
     waiters: LinkedList<WaitQueueEntry>,
 }
@@ -55,8 +73,28 @@ impl SemaphoreState {
     fn new(is_fair: bool, permits: usize) -> Self {
         SemaphoreState {
             is_fair,
+            is_closed: false,
             permits,
             waiters: LinkedList::new(),
+        }
+    }
+
+    fn close(&mut self) {
+        if self.is_closed {
+            return;
+        }
+        self.is_closed = true;
+
+        // Wakeup all waiters.
+        let mut waiters = self.waiters.take();
+
+        unsafe {
+            for waiter in waiters.into_iter() {
+                (*waiter).state = PollState::Cancelled;
+                if let RSome(handle) = (*waiter).task.take() {
+                    handle.wake();
+                }
+            }
         }
     }
 
@@ -92,7 +130,7 @@ impl SemaphoreState {
                     last_waiter.state = PollState::Notified;
 
                     let task = &last_waiter.task;
-                    if let Some(ref handle) = task {
+                    if let RSome(ref handle) = task {
                         handle.wake_by_ref();
                     }
                 }
@@ -102,8 +140,7 @@ impl SemaphoreState {
                 // That avoids having to remove the wait element later.
                 if !self.is_fair {
                     self.waiters.remove_last();
-                }
-                else {
+                } else {
                     // For a fair Semaphore we never wake more than 1 task.
                     // That one needs to acquire the Semaphore.
                     // TODO: We actually should be able to wake more, since
@@ -135,16 +172,18 @@ impl SemaphoreState {
     ///
     /// Returns true if the permits were obtained and false otherwise.
     fn try_acquire_sync(&mut self, required_permits: usize) -> bool {
-        // Permits can only be obtained synchronously if there are
+        // Permits can only be obtained synchronously if
+        // - semaphore is not closed
         // - enough permits available
         // - the Semaphore is either not fair, or there are no waiters
         // - required_permits == 0
-        if (self.permits >= required_permits) &&
-            (!self.is_fair || self.waiters.is_empty() || required_permits == 0) {
+        if !self.is_closed
+            && (self.permits >= required_permits)
+            && (!self.is_fair || self.waiters.is_empty() || required_permits == 0)
+        {
             self.permits -= required_permits;
             true
-        }
-        else {
+        } else {
             false
         }
     }
@@ -161,48 +200,58 @@ impl SemaphoreState {
     ) -> Poll<()> {
         match wait_node.state {
             PollState::New => {
-                // The fast path - enough permits are available
-                if self.try_acquire_sync(wait_node.required_permits) {
-                    wait_node.state = PollState::Done;
+                if self.is_closed {
+                    wait_node.state = PollState::Cancelled;
                     Poll::Ready(())
                 }
-                else {
+                // The fast path - enough permits are available
+                else if self.try_acquire_sync(wait_node.required_permits) {
+                    wait_node.state = PollState::Done;
+                    Poll::Ready(())
+                } else {
                     // Add the task to the wait queue
-                    wait_node.task = Some(cx.waker().clone());
+                    wait_node.task = RSome(RWaker::new(cx.waker().clone()));
                     wait_node.state = PollState::Waiting;
                     self.waiters.add_front(wait_node);
                     Poll::Pending
                 }
-            },
+            }
             PollState::Waiting => {
+                if self.is_closed {
+                    wait_node.state = PollState::Cancelled;
+                    self.force_remove_waiter(wait_node);
+                    Poll::Ready(())
+                }
                 // The SemaphoreAcquireFuture is already in the queue.
-                if self.is_fair {
+                else if self.is_fair {
                     // The task needs to wait until it gets notified in order to
                     // maintain the ordering.
                     Poll::Pending
                 }
-                else {
-                    // For throughput improvement purposes, check immediately
-                    // if enough permits are available
-                    if self.permits >= wait_node.required_permits {
-                        self.permits -= wait_node.required_permits;
-                        wait_node.state = PollState::Done;
-                        // Since this waiter has been registered before, it must
-                        // get removed from the waiter list.
-                        self.force_remove_waiter(wait_node);
-                        Poll::Ready(())
-                    }
-                    else {
-                        Poll::Pending
-                    }
+                // For throughput improvement purposes, check immediately
+                // if enough permits are available
+                else if self.permits >= wait_node.required_permits {
+                    self.permits -= wait_node.required_permits;
+                    wait_node.state = PollState::Done;
+                    // Since this waiter has been registered before, it must
+                    // get removed from the waiter list.
+                    self.force_remove_waiter(wait_node);
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
                 }
-            },
+            }
             PollState::Notified => {
+                if self.is_closed {
+                    wait_node.state = PollState::Cancelled;
+                    self.force_remove_waiter(wait_node);
+                    Poll::Ready(())
+                }
                 // We had been woken by the semaphore, since the semaphore is available again.
                 // The semaphore thereby removed us from the waiters list.
                 // Just try to lock again. If the semaphore isn't available,
                 // we need to add it to the wait queue again.
-                if self.permits >= wait_node.required_permits {
+                else if self.permits >= wait_node.required_permits {
                     if self.is_fair {
                         // In a fair Semaphore, the WaitQueueEntry is kept in the
                         // linked list and must be removed here
@@ -216,24 +265,29 @@ impl SemaphoreState {
                     }
                     wait_node.state = PollState::Done;
                     Poll::Ready(())
-                }
-                else {
+                } else {
                     // A fair semaphore should never end up in that branch, since
                     // it's only notified when it's permits are guaranteed to
                     // be available. assert! in order to find logic bugs
-                    assert!(!self.is_fair, "Fair semaphores should always be ready when notified");
+                    assert!(
+                        !self.is_fair,
+                        "Fair semaphores should always be ready when notified"
+                    );
                     // Add to queue
-                    wait_node.task = Some(cx.waker().clone());
+                    wait_node.task = RSome(RWaker::new(cx.waker().clone()));
                     wait_node.state = PollState::Waiting;
                     self.waiters.add_front(wait_node);
                     Poll::Pending
                 }
-
-            },
+            }
             PollState::Done => {
                 // The future had been polled to completion before
                 panic!("polled Mutex after completion");
-            },
+            }
+            PollState::Cancelled => {
+                // Waked up by the semaphore being closed.
+                Poll::Ready(())
+            }
         }
     }
 
@@ -265,13 +319,13 @@ impl SemaphoreState {
                 wait_node.state = PollState::Done;
                 // Wakeup more waiters
                 self.wakeup_waiters();
-            },
+            }
             PollState::Waiting => {
                 // Remove the WaitQueueEntry from the linked list
                 unsafe { self.force_remove_waiter(wait_node) };
                 wait_node.state = PollState::Done;
-            },
-            PollState::New | PollState::Done => {},
+            }
+            PollState::New | PollState::Done | PollState::Cancelled => {}
         }
     }
 }
@@ -281,22 +335,22 @@ impl SemaphoreState {
 /// When this structure is dropped (falls out of scope),
 /// the amount of permits that was used in the `acquire()` call will be released
 /// back to the Semaphore.
-pub struct GenericSemaphoreReleaser<'a, MutexType: RawMutex> {
+#[derive(StableAbi)]
+#[repr(C)]
+pub struct Releaser {
     /// The Semaphore which is associated with this Releaser
-    semaphore: &'a GenericSemaphore<MutexType>,
+    semaphore: Semaphore,
     /// The amount of permits to release
     permits: usize,
 }
 
-impl<MutexType: RawMutex> core::fmt::Debug
-for GenericSemaphoreReleaser<'_, MutexType> {
+impl core::fmt::Debug for Releaser {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.debug_struct("GenericSemaphoreReleaser")
-            .finish()
+        f.debug_struct("SemaphoreReleaser").finish()
     }
 }
 
-impl<MutexType: RawMutex> GenericSemaphoreReleaser<'_, MutexType> {
+impl Releaser {
     /// Prevents the SemaphoreReleaser from automatically releasing the permits
     /// when it gets dropped.
     /// This is helpful if the permits must be acquired for a longer lifetime
@@ -310,7 +364,7 @@ impl<MutexType: RawMutex> GenericSemaphoreReleaser<'_, MutexType> {
     }
 }
 
-impl<MutexType: RawMutex> Drop for GenericSemaphoreReleaser<'_, MutexType> {
+impl Drop for Releaser {
     fn drop(&mut self) {
         // Release the requested amount of permits to the semaphore
         if self.permits != 0 {
@@ -319,11 +373,14 @@ impl<MutexType: RawMutex> Drop for GenericSemaphoreReleaser<'_, MutexType> {
     }
 }
 
+#[derive(PartialEq, Debug)]
+pub struct AcquireError(());
+
 /// A future which resolves when the target semaphore has been successfully acquired.
 #[must_use = "futures do nothing unless polled"]
-pub struct GenericSemaphoreAcquireFuture<'a, MutexType: RawMutex> {
+pub struct SemaphoreAcquire {
     /// The Semaphore which should get acquired trough this Future
-    semaphore: Option<&'a GenericSemaphore<MutexType>>,
+    semaphore: Option<Semaphore>,
     /// Node for waiting at the semaphore
     wait_node: ListNode<WaitQueueEntry>,
     /// Whether the obtained permits should automatically be released back
@@ -334,68 +391,71 @@ pub struct GenericSemaphoreAcquireFuture<'a, MutexType: RawMutex> {
 // Safety: Futures can be sent between threads as long as the underlying
 // semaphore is thread-safe (Sync), which allows to poll/register/unregister from
 // a different thread.
-unsafe impl<'a, MutexType: RawMutex + Sync> Send for GenericSemaphoreAcquireFuture<'a, MutexType> {}
+unsafe impl Send for SemaphoreAcquire {}
 
-impl<'a, MutexType: RawMutex> core::fmt::Debug
-for GenericSemaphoreAcquireFuture<'a, MutexType> {
+impl core::fmt::Debug for SemaphoreAcquire {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.debug_struct("GenericSemaphoreAcquireFuture")
-            .finish()
+        f.debug_struct("SemaphoreAcquire").finish()
     }
 }
 
-impl<'a, MutexType: RawMutex> Future for GenericSemaphoreAcquireFuture<'a, MutexType> {
-    type Output = GenericSemaphoreReleaser<'a, MutexType>;
+impl Future for SemaphoreAcquire {
+    type Output = Result<Releaser, AcquireError>;
 
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Safety: The next operations are safe, because Pin promises us that
-        // the address of the wait queue entry inside GenericSemaphoreAcquireFuture is stable,
+        // the address of the wait queue entry inside SemaphoreAcquireFuture is stable,
         // and we don't move any fields inside the future until it gets dropped.
-        let mut_self: &mut GenericSemaphoreAcquireFuture<MutexType> = unsafe {
-            Pin::get_unchecked_mut(self)
+        let mut_self: &mut SemaphoreAcquire = unsafe { Pin::get_unchecked_mut(self) };
+
+        let semaphore = mut_self
+            .semaphore
+            .as_mut()
+            .expect("polled SemaphoreAcquire after completion");
+
+        let poll_res = {
+            let mut semaphore_state = semaphore.state.lock();
+
+            unsafe { semaphore_state.try_acquire(&mut mut_self.wait_node, cx) }
         };
-
-        let semaphore = mut_self.semaphore.expect("polled GenericSemaphoreAcquireFuture after completion");
-        let mut semaphore_state = semaphore.state.lock();
-
-        let poll_res = unsafe {
-            semaphore_state.try_acquire(
-                &mut mut_self.wait_node,
-                cx)};
 
         match poll_res {
             Poll::Pending => Poll::Pending,
             Poll::Ready(()) => {
+                // The semaphore was closed before we could acquire it.
+                if let PollState::Cancelled = mut_self.wait_node.state {
+                    return Poll::Ready(Err(AcquireError(())));
+                }
                 // The semaphore was acquired.
-                mut_self.semaphore = None;
                 let to_release = match mut_self.auto_release {
                     true => mut_self.wait_node.required_permits,
                     false => 0,
                 };
-                Poll::Ready(GenericSemaphoreReleaser::<'a, MutexType>{
-                    semaphore,
+                Poll::Ready(Ok(Releaser {
+                    semaphore: mut_self.semaphore.take().unwrap(),
                     permits: to_release,
-                })
-            },
+                }))
+            }
         }
     }
 }
 
-impl<'a, MutexType: RawMutex> FusedFuture for GenericSemaphoreAcquireFuture<'a, MutexType> {
-   fn is_terminated(&self) -> bool {
-       self.semaphore.is_none()
-   }
+impl FusedFuture for SemaphoreAcquire {
+    fn is_terminated(&self) -> bool {
+        self.semaphore.is_none() || self.semaphore.as_ref().unwrap().is_closed()
+    }
 }
 
-impl<'a, MutexType: RawMutex> Drop for GenericSemaphoreAcquireFuture<'a, MutexType> {
+impl Drop for SemaphoreAcquire {
     fn drop(&mut self) {
-        // If this GenericSemaphoreAcquireFuture has been polled and it was added to the
+        // The waiter was already unregistered, no need to do anything.
+        if let PollState::Cancelled = self.wait_node.state {
+            return;
+        }
+        // If this SemaphoreAcquireFuture has been polled and it was added to the
         // wait queue at the semaphore, it must be removed before dropping.
         // Otherwise the semaphore would access invalid memory.
-        if let Some(semaphore) = self.semaphore {
+        if let Some(semaphore) = self.semaphore.take() {
             let mut semaphore_state = semaphore.state.lock();
             // Analysis: Does the number of permits play a role here?
             // The future was notified because there was a certain amount of permits
@@ -411,17 +471,19 @@ impl<'a, MutexType: RawMutex> Drop for GenericSemaphoreAcquireFuture<'a, MutexTy
 }
 
 /// A futures-aware semaphore.
-pub struct GenericSemaphore<MutexType: RawMutex> {
-    state: LockApiMutex<MutexType, SemaphoreState>,
+#[derive(StableAbi)]
+#[repr(C)]
+pub struct Semaphore {
+    state: RArc<RMutex<SemaphoreState>>,
 }
 
 // It is safe to send semaphores between threads, as long as they are not used and
 // thereby borrowed
-unsafe impl<MutexType: RawMutex + Send> Send for GenericSemaphore<MutexType> {}
+unsafe impl Send for Semaphore {}
 // The Semaphore is thread-safe as long as the utilized Mutex is thread-safe
-unsafe impl<MutexType: RawMutex + Sync> Sync for GenericSemaphore<MutexType> {}
+unsafe impl Sync for Semaphore {}
 
-impl<MutexType: RawMutex> core::fmt::Debug for GenericSemaphore<MutexType> {
+impl core::fmt::Debug for Semaphore {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("Semaphore")
             .field("permits", &self.permits())
@@ -429,7 +491,15 @@ impl<MutexType: RawMutex> core::fmt::Debug for GenericSemaphore<MutexType> {
     }
 }
 
-impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
+impl Clone for Semaphore {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl Semaphore {
     /// Creates a new futures-aware semaphore.
     ///
     /// `is_fair` defines whether the `Semaphore` should behave be fair regarding the
@@ -437,7 +507,7 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
     /// a `Semaphore` to retry acquiring it once it's available again.
     /// Other waiters must wait until either this acquire attempt completes, and
     /// the `Semaphore` has enough permits after that, or until the
-    /// [`SemaphoreAcquireFuture`] which tried to acquire the `Semaphore` is dropped.
+    /// [`SemaphoreAcquire`] which tried to acquire the `Semaphore` is dropped.
     ///
     /// If the `Semaphore` isn't fair, waiters that wait for a high amount of
     /// permits might never succeed since the permits might be stolen in between
@@ -448,9 +518,9 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
     ///
     /// `permits` is the amount of permits that a semaphore should hold when
     /// created.
-    pub fn new(is_fair: bool, permits: usize) -> GenericSemaphore<MutexType> {
-        GenericSemaphore::<MutexType> {
-            state: LockApiMutex::new(SemaphoreState::new(is_fair, permits)),
+    pub fn new(is_fair: bool, permits: usize) -> Semaphore {
+        Semaphore {
+            state: RArc::new(RMutex::new(SemaphoreState::new(is_fair, permits))),
         }
     }
 
@@ -458,11 +528,11 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
     ///
     /// This method returns a future that will resolve once the given amount of
     /// permits have been acquired.
-    /// The Future will resolve to a [`GenericSemaphoreReleaser`], which will
+    /// The Future will resolve to a [`SemaphoreReleaser`], which will
     /// release all acquired permits automatically when dropped.
-    pub fn acquire(&self, nr_permits: usize) -> GenericSemaphoreAcquireFuture<'_, MutexType> {
-        GenericSemaphoreAcquireFuture::<MutexType> {
-            semaphore: Some(&self),
+    pub fn acquire(&self, nr_permits: usize) -> SemaphoreAcquire {
+        SemaphoreAcquire {
+            semaphore: Some(self.clone()),
             wait_node: ListNode::new(WaitQueueEntry::new(nr_permits)),
             auto_release: true,
         }
@@ -470,19 +540,18 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
 
     /// Tries to acquire a certain amount of permits on a semaphore.
     ///
-    /// If acquiring the permits is successful, a [`GenericSemaphoreReleaser`]
+    /// If acquiring the permits is successful, a [`SemaphoreReleaser`]
     /// will be returned, which will release all acquired permits automatically
     /// when dropped.
     ///
     /// Otherwise `None` will be returned.
-    pub fn try_acquire(&self, nr_permits: usize) -> Option<GenericSemaphoreReleaser<'_, MutexType>> {
+    pub fn try_acquire(&self, nr_permits: usize) -> Option<Releaser> {
         if self.state.lock().try_acquire_sync(nr_permits) {
-            Some(GenericSemaphoreReleaser{
-                semaphore: self,
+            Some(Releaser {
+                semaphore: self.clone(),
                 permits: nr_permits,
             })
-        }
-        else {
+        } else {
             None
         }
     }
@@ -490,11 +559,11 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
     /// Releases the given amount of permits back to the semaphore.
     ///
     /// This method should in most cases not be used, since the
-    /// [`GenericSemaphoreReleaser`] which is obtained when acquiring a Semaphore
+    /// [`SemaphoreReleaser`] which is obtained when acquiring a Semaphore
     /// will automatically release the obtained permits again.
     ///
     /// Therefore this method should only be used if the automatic release was
-    /// disabled by calling [`GenericSemaphoreReleaser::disarm`],
+    /// disabled by calling [`SemaphoreReleaser::disarm`],
     /// or when the amount of permits in the Semaphore
     /// should increase from the initial amount.
     pub fn release(&self, nr_permits: usize) {
@@ -505,30 +574,628 @@ impl<MutexType: RawMutex> GenericSemaphore<MutexType> {
     pub fn permits(&self) -> usize {
         self.state.lock().permits()
     }
+
+    /// Prevents the `Semaphore` from being acquired from not on, waking up all
+    /// waiters.
+    ///
+    /// Attempting to `acquire` the `Semaphore` will return an `AcquireError`
+    /// from now on.
+    pub fn close(&self) {
+        self.state.lock().close()
+    }
+
+    /// Returns whether the semaphore was closed.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().is_closed
+    }
 }
 
-// Export a non thread-safe version using NoopLock
+#[cfg(test)]
+mod tests {
+    use super::Semaphore;
+    use futures::future::{FusedFuture, Future, FutureExt};
+    use futures::task::{Context, Poll};
+    use futures_test::task::{new_count_waker, panic_waker};
+    use pin_utils::pin_mut;
 
-/// A [`GenericSemaphore`] which is not thread-safe.
-pub type LocalSemaphore = GenericSemaphore<NoopLock>;
-/// A [`GenericSemaphoreReleaser`] for [`LocalSemaphore`].
-pub type LocalSemaphoreReleaser<'a> = GenericSemaphoreReleaser<'a, NoopLock>;
-/// A [`GenericSemaphoreAcquireFuture`] for [`LocalSemaphore`].
-pub type LocalSemaphoreAcquireFuture<'a> = GenericSemaphoreAcquireFuture<'a, NoopLock>;
+    #[test]
+    fn uncontended_acquire() {
+        for is_fair in &[true, false] {
+            let waker = &panic_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 2);
+            assert_eq!(2, sem.permits());
 
-#[cfg(feature = "std")]
-mod if_std {
-    use super::*;
+            {
+                let sem_fut = sem.acquire(1);
+                pin_mut!(sem_fut);
+                match sem_fut.as_mut().poll(cx) {
+                    Poll::Pending => panic!("Expect semaphore to get acquired"),
+                    Poll::Ready(_guard) => {
+                        assert_eq!(1, sem.permits());
+                    }
+                };
+                assert!(sem_fut.as_mut().is_terminated());
+                assert_eq!(2, sem.permits());
+            }
+            assert_eq!(2, sem.permits());
 
-    // Export a thread-safe version using parking_lot::RawMutex
+            {
+                let sem_fut = sem.acquire(2);
+                pin_mut!(sem_fut);
+                match sem_fut.as_mut().poll(cx) {
+                    Poll::Pending => panic!("Expect semaphore to get acquired"),
+                    Poll::Ready(_guard) => {
+                        assert_eq!(0, sem.permits());
+                    }
+                };
+                assert!(sem_fut.as_mut().is_terminated());
+            }
 
-    /// A [`GenericSemaphore`] backed by [`parking_lot`].
-    pub type Semaphore = GenericSemaphore<parking_lot::RawMutex>;
-    /// A [`GenericSemaphoreReleaser`] for [`Semaphore`].
-    pub type SemaphoreReleaser<'a> = GenericSemaphoreReleaser<'a, parking_lot::RawMutex>;
-    /// A [`GenericSemaphoreAcquireFuture`] for [`Semaphore`].
-    pub type SemaphoreAcquireFuture<'a> = GenericSemaphoreAcquireFuture<'a, parking_lot::RawMutex>;
+            assert_eq!(2, sem.permits());
+        }
+    }
+
+    #[test]
+    fn closing_prevents_acquire() {
+        let mut sem = Semaphore::new(true, 2);
+        sem.close();
+
+        let waker = &panic_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        let sem_fut = sem.acquire(2);
+        pin_mut!(sem_fut);
+        match sem_fut.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(res) => {
+                let err = res.unwrap_err();
+            }
+        };
+        assert!(sem_fut.as_mut().is_terminated());
+    }
+
+    #[test]
+    fn closing_wakes_waiters() {
+        let mut sem = Semaphore::new(true, 1);
+
+        let (waker, count) = new_count_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        let sem_fut = sem.acquire(2);
+        pin_mut!(sem_fut);
+        match sem_fut.as_mut().poll(cx) {
+            Poll::Pending => (),
+            Poll::Ready(_) => {
+                panic!("Expect semaphore to not get acquired");
+            }
+        };
+
+        assert_eq!(count, 0);
+        sem.close();
+        assert_eq!(count, 1);
+
+        let sem_fut = sem.acquire(2);
+        pin_mut!(sem_fut);
+        match sem_fut.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(res) => {
+                let err = res.unwrap_err();
+            }
+        };
+        assert!(sem_fut.as_mut().is_terminated());
+    }
+
+    #[test]
+    fn manual_release_via_disarm() {
+        for is_fair in &[true, false] {
+            let waker = &panic_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 2);
+            assert_eq!(2, sem.permits());
+
+            {
+                let sem_fut = sem.acquire(1);
+                pin_mut!(sem_fut);
+                match sem_fut.as_mut().poll(cx) {
+                    Poll::Pending => panic!("Expect semaphore to get acquired"),
+                    Poll::Ready(mut res) => {
+                        assert_eq!(1, sem.permits());
+                        res.unwrap().disarm();
+                    }
+                };
+                assert!(sem_fut.as_mut().is_terminated());
+                assert_eq!(1, sem.permits());
+            }
+
+            assert_eq!(1, sem.permits());
+
+            {
+                let sem_fut = sem.acquire(1);
+                pin_mut!(sem_fut);
+                match sem_fut.as_mut().poll(cx) {
+                    Poll::Pending => panic!("Expect semaphore to get acquired"),
+                    Poll::Ready(mut res) => {
+                        assert_eq!(0, sem.permits());
+                        res.unwrap().disarm();
+                    }
+                };
+                assert!(sem_fut.as_mut().is_terminated());
+            }
+
+            assert_eq!(0, sem.permits());
+
+            sem.release(2);
+            assert_eq!(2, sem.permits());
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn poll_after_completion_should_panic() {
+        for is_fair in &[true, false] {
+            let waker = &panic_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 2);
+
+            let sem_fut = sem.acquire(2);
+            pin_mut!(sem_fut);
+            match sem_fut.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired"),
+                Poll::Ready(guard) => guard,
+            };
+            assert!(sem_fut.as_mut().is_terminated());
+
+            let _ = sem_fut.poll(cx);
+        }
+    }
+
+    #[test]
+    fn contended_acquire() {
+        for is_fair in &[false, true] {
+            let (waker, count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 3);
+
+            let sem_fut1 = sem.acquire(3);
+            pin_mut!(sem_fut1);
+
+            // Acquire the semaphore
+            let guard1 = match sem_fut1.poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 1"),
+                Poll::Ready(guard) => guard,
+            };
+
+            // The next acquire attempts must fail
+            let sem_fut2 = sem.acquire(1);
+            pin_mut!(sem_fut2);
+            assert!(sem_fut2.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut2.as_mut().is_terminated());
+            let sem_fut3 = sem.acquire(2);
+            pin_mut!(sem_fut3);
+            assert!(sem_fut3.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut3.as_mut().is_terminated());
+            let sem_fut4 = sem.acquire(2);
+            pin_mut!(sem_fut4);
+            assert!(sem_fut4.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut4.as_mut().is_terminated());
+            assert_eq!(count, 0);
+
+            // Release - semaphore should be available again and allow
+            // fut2 and fut3 to complete
+            assert_eq!(0, sem.permits());
+            drop(guard1);
+            assert_eq!(3, sem.permits());
+            // At least one task should be awoken.
+            if *is_fair {
+                assert_eq!(count, 1);
+            } else {
+                assert_eq!(count, 2);
+            }
+
+            let guard2 = match sem_fut2.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 2"),
+                Poll::Ready(guard) => guard,
+            };
+            assert!(sem_fut2.as_mut().is_terminated());
+            assert_eq!(2, sem.permits());
+            // In the fair case, the next task should be woken up here
+            assert_eq!(count, 2);
+
+            let guard3 = match sem_fut3.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 3"),
+                Poll::Ready(guard) => guard,
+            };
+            assert!(sem_fut3.as_mut().is_terminated());
+            assert_eq!(0, sem.permits());
+
+            assert!(sem_fut4.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut4.as_mut().is_terminated());
+
+            // Release - some permits should be available again
+            drop(guard2);
+            assert_eq!(1, sem.permits());
+            assert_eq!(count, 2);
+
+            assert!(sem_fut4.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut4.as_mut().is_terminated());
+
+            // After releasing the permits from fut3, there should be
+            // enough permits for fut4 getting woken.
+            drop(guard3);
+            assert_eq!(3, sem.permits());
+            assert_eq!(count, 3);
+
+            let guard4 = match sem_fut4.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 4"),
+                Poll::Ready(guard) => guard,
+            };
+            assert!(sem_fut4.as_mut().is_terminated());
+
+            drop(guard4);
+            assert_eq!(3, sem.permits());
+            assert_eq!(count, 3);
+        }
+    }
+
+    #[test]
+    fn acquire_synchronously() {
+        for is_fair in &[true] {
+            let (waker, count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 3);
+
+            let sem_fut1 = sem.acquire(3);
+            pin_mut!(sem_fut1);
+
+            // Acquire the semaphore
+            let guard1 = match sem_fut1.poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 1"),
+                Poll::Ready(guard) => guard,
+            };
+
+            // Some failing acquire attempts
+            assert!(sem.try_acquire(1).is_none());
+
+            // Add an async waiter
+            let mut sem_fut2 = Box::pin(sem.acquire(1));
+            assert!(sem_fut2.as_mut().poll(cx).is_pending());
+            assert_eq!(count, 0);
+
+            // Release - semaphore should be available again
+            drop(guard1);
+            assert_eq!(3, sem.permits());
+
+            // In the fair case we shouldn't be able to obtain the
+            // semaphore asynchronously. In the unfair case it should
+            // be possible.
+            if *is_fair {
+                assert!(sem.try_acquire(1).is_none());
+
+                // Cancel async acquire attempt
+                drop(sem_fut2);
+                // Now the semaphore should be acquireable
+            }
+
+            let guard = sem.try_acquire(1).unwrap();
+            assert_eq!(2, sem.permits());
+            let mut guard2 = sem.try_acquire(2).unwrap();
+            assert_eq!(0, sem.permits());
+            guard2.disarm();
+            sem.release(2);
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn acquire_0_permits_without_other_waiters() {
+        for is_fair in &[false, true] {
+            let (waker, _count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 3);
+
+            // Acquire the semaphore
+            let guard1 = sem.try_acquire(3).unwrap();
+            assert_eq!(0, sem.permits());
+
+            let sem_fut2 = sem.acquire(0);
+            pin_mut!(sem_fut2);
+            let guard2 = match sem_fut2.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 2"),
+                Poll::Ready(guard) => guard,
+            };
+
+            drop(guard2);
+            assert_eq!(0, sem.permits());
+            drop(guard1);
+            assert_eq!(3, sem.permits());
+        }
+    }
+
+    #[test]
+    fn acquire_0_permits_with_other_waiters() {
+        for is_fair in &[false, true] {
+            let (waker, _count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 3);
+
+            // Acquire the semaphore
+            let guard1 = sem.try_acquire(3).unwrap();
+
+            assert_eq!(0, sem.permits());
+
+            let sem_fut2 = sem.acquire(1);
+            pin_mut!(sem_fut2);
+            assert!(sem_fut2.as_mut().poll(cx).is_pending());
+
+            let sem_fut3 = sem.acquire(0);
+            pin_mut!(sem_fut3);
+            let guard3 = match sem_fut3.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 3"),
+                Poll::Ready(guard) => guard,
+            };
+
+            drop(guard3);
+            assert_eq!(0, sem.permits());
+            drop(guard1);
+            assert_eq!(3, sem.permits());
+
+            let guard2 = match sem_fut2.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired 2"),
+                Poll::Ready(guard) => guard,
+            };
+            assert_eq!(2, sem.permits());
+            drop(guard2);
+        }
+    }
+
+    #[test]
+    fn cancel_wait_for_semaphore() {
+        for is_fair in &[true, false] {
+            let (waker, count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 5);
+
+            // Acquire the semaphore
+            let guard1 = sem.try_acquire(5).unwrap();
+
+            // The second and third lock attempt must fail
+            let mut sem_fut2 = Box::pin(sem.acquire(1));
+            let mut sem_fut3 = Box::pin(sem.acquire(1));
+
+            assert!(sem_fut2.as_mut().poll(cx).is_pending());
+            assert!(sem_fut3.as_mut().poll(cx).is_pending());
+
+            // Before the semaphore gets available, cancel one acquire attempt
+            drop(sem_fut2);
+
+            // Unlock - semaphore should be available again.
+            // fut2 should have been notified
+            drop(guard1);
+            assert_eq!(count, 1);
+
+            // Unlock - semaphore should be available again
+            match sem_fut3.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired"),
+                Poll::Ready(guard) => guard,
+            };
+        }
+    }
+
+    #[test]
+    fn unlock_next_when_notification_is_not_used() {
+        for is_fair in &[true, false] {
+            let (waker, count) = new_count_waker();
+            let cx = &mut Context::from_waker(&waker);
+            let sem = Semaphore::new(*is_fair, 2);
+
+            let guard1 = sem.try_acquire(2).unwrap();
+
+            // The second and third acquire attempt must fail
+            let mut sem_fut2 = Box::pin(sem.acquire(1));
+            let mut sem_fut3 = Box::pin(sem.acquire(1));
+
+            assert!(sem_fut2.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut2.as_mut().is_terminated());
+            assert!(sem_fut3.as_mut().poll(cx).is_pending());
+            assert!(!sem_fut3.as_mut().is_terminated());
+            assert_eq!(count, 0);
+
+            // Release - semaphore should be available again. fut2 should have been notified
+            drop(guard1);
+            if *is_fair {
+                assert_eq!(count, 1);
+            } else {
+                assert_eq!(count, 2);
+            }
+
+            // We don't use the notification. Expect the next waiting task to be woken up
+            drop(sem_fut2);
+            assert_eq!(count, 2);
+
+            match sem_fut3.as_mut().poll(cx) {
+                Poll::Pending => panic!("Expect semaphore to get acquired"),
+                Poll::Ready(guard) => guard,
+            };
+        }
+    }
+
+    #[test]
+    fn new_waiters_on_unfair_semaphore_can_acquire_future_while_one_task_is_notified() {
+        let (waker, count) = new_count_waker();
+        let cx = &mut Context::from_waker(&waker);
+        let sem = Semaphore::new(false, 3);
+
+        // Acquire the semaphore
+        let guard1 = sem.try_acquire(3).unwrap();
+
+        // The second and third acquire attempt must fail
+        let mut sem_fut2 = Box::pin(sem.acquire(3));
+        let mut sem_fut3 = Box::pin(sem.acquire(3));
+
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+
+        // Release - Semaphore should be available again. fut2 should have been notified
+        drop(guard1);
+        assert_eq!(count, 1);
+
+        // Acquire fut3 in between. This should succeed
+        let guard3 = match sem_fut3.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(guard) => guard,
+        };
+        // Now fut2 can't use it's notification and is still pending
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+
+        // When we drop fut3, the semaphore should signal that it's available for fut2,
+        // which needs to have re-registered
+        drop(guard3);
+        assert_eq!(count, 2);
+        match sem_fut2.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+    }
+
+    #[test]
+    fn waiters_on_unfair_semaphore_can_acquire_future_through_repolling_if_one_task_is_notified() {
+        let (waker, count) = new_count_waker();
+        let cx = &mut Context::from_waker(&waker);
+        let sem = Semaphore::new(false, 3);
+
+        // Acquire the semaphore
+        let guard1 = sem.try_acquire(3).unwrap();
+
+        // The second and third acquire attempt must fail
+        let mut sem_fut2 = Box::pin(sem.acquire(3));
+        let mut sem_fut3 = Box::pin(sem.acquire(3));
+        // Start polling both futures, which means both are waiters
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+        assert!(sem_fut3.as_mut().poll(cx).is_pending());
+
+        // Release - semaphore should be available again. fut2 should have been notified
+        drop(guard1);
+        assert_eq!(count, 1);
+
+        // Acquire fut3 in between. This should succeed
+        let guard3 = match sem_fut3.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(guard) => guard,
+        };
+        // Now fut2 can't use it's notification and is still pending
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+
+        // When we drop fut3, the mutex should signal that it's available for fut2,
+        // which needs to have re-registered
+        drop(guard3);
+        assert_eq!(count, 2);
+        match sem_fut2.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+    }
+
+    #[test]
+    fn new_waiters_on_fair_semaphore_cant_acquire_future_while_one_task_is_notified() {
+        let (waker, count) = new_count_waker();
+        let cx = &mut Context::from_waker(&waker);
+        let sem = Semaphore::new(true, 3);
+
+        // Acquire the semaphore
+        let guard1 = sem.try_acquire(3).unwrap();
+
+        // The second and third acquire attempt must fail
+        let mut sem_fut2 = Box::pin(sem.acquire(3));
+        let mut sem_fut3 = Box::pin(sem.acquire(3));
+
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+
+        // Release - semaphore should be available again. fut2 should have been notified
+        drop(guard1);
+        assert_eq!(count, 1);
+
+        // Try to acquire fut3 in between. This should fail
+        assert!(sem_fut3.as_mut().poll(cx).is_pending());
+
+        // fut2 should be be able to get acquired
+        match sem_fut2.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+
+        // Now fut3 should have been signaled and should be able to get acquired
+        assert_eq!(count, 2);
+        match sem_fut3.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+    }
+
+    #[test]
+    fn waiters_on_fair_semaphore_cant_acquire_future_through_repolling_if_one_task_is_notified() {
+        let (waker, count) = new_count_waker();
+        let cx = &mut Context::from_waker(&waker);
+        let sem = Semaphore::new(true, 3);
+
+        // Acquire the semaphore
+        let guard1 = sem.try_acquire(3).unwrap();
+
+        // The second and third acquire attempt must fail
+        let mut sem_fut2 = Box::pin(sem.acquire(3));
+        let mut sem_fut3 = Box::pin(sem.acquire(3));
+
+        assert!(sem_fut2.as_mut().poll(cx).is_pending());
+        assert!(sem_fut3.as_mut().poll(cx).is_pending());
+
+        // Release - semaphore should be available again. fut2 should have been notified
+        drop(guard1);
+        assert_eq!(count, 1);
+
+        // Acquire fut3 in between. This should fail, since fut2 should get the permits first
+        assert!(sem_fut3.as_mut().poll(cx).is_pending());
+
+        // fut2 should be acquired
+        match sem_fut2.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+
+        // Now fut3 should be able to get acquired
+        assert_eq!(count, 2);
+
+        match sem_fut3.as_mut().poll(cx) {
+            Poll::Pending => panic!("Expect semaphore to get acquired"),
+            Poll::Ready(_guard) => {}
+        };
+    }
+
+    fn is_send<T: Send>(_: &T) {}
+
+    fn is_send_value<T: Send>(_: T) {}
+
+    fn is_sync<T: Sync>(_: &T) {}
+
+    #[test]
+    fn semaphore_futures_are_send() {
+        let sem = Semaphore::new(true, 3);
+        is_sync(&sem);
+        {
+            let wait_fut = sem.acquire(3);
+            is_send(&wait_fut);
+            pin_mut!(wait_fut);
+            is_send(&wait_fut);
+
+            let waker = &panic_waker();
+            let cx = &mut Context::from_waker(&waker);
+            pin_mut!(wait_fut);
+            let res = wait_fut.poll_unpin(cx);
+            let releaser = match res {
+                Poll::Ready(v) => v,
+                Poll::Pending => panic!("Expected to be ready"),
+            };
+            is_send(&releaser);
+            is_send_value(releaser);
+        }
+        is_send_value(sem);
+    }
 }
-
-#[cfg(feature = "std")]
-pub use self::if_std::*;

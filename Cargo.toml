@@ -1,29 +1,21 @@
 [package]
-name = "futures-intrusive"
+name = "stable-sync"
 edition = "2018"
-version = "0.2.0"
-authors = ["Matthias Einwag <matthias.einwag@live.com>"]
+version = "0.0.1"
+authors = ["Maxence Caron <jean-arioldie@protonmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Matthias247/futures-intrusive"
-homepage = "https://github.com/Matthias247/futures-intrusive"
-description = """
-Futures based on intrusive data structures - for std and no-std environments.
-"""
-
-[lib]
-name = "futures_intrusive"
-
-[features]
-std = ["futures-core-preview/std", "parking_lot"]
-default = ["std"]
 
 [dependencies]
 futures-core-preview = { version = "0.3.0-alpha.18", default-features = false }
+futures-util-preview = { version = "0.3.0-alpha.18", default-features = false }
 lock_api = "0.3.1"
-parking_lot = { version = "0.9", optional = true }
+parking_lot = { version = "0.9" }
+#abi_stable = "0.7"
+abi_stable = { git = "https://github.com/jean-airoldie/abi_stable_crates", branch = "raw_locks" }
 
 [dev-dependencies]
-futures-preview = { version = "0.3.0-alpha.18", default-features = true, features=["async-await", "nightly"] }
+tokio-macros = "0.2.0-alpha.6"
+futures-preview = { version = "0.3.0-alpha.18", default-features = true, features=["async-await"] }
 futures-test-preview = { version = "0.3.0-alpha.18", default-features = true }
 pin-utils = "0.1.0-alpha.4"
 criterion = "0.3.0"

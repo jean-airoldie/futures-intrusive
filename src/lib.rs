@@ -215,20 +215,19 @@
 //!   them less ergonomic to use.
 //!
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
 #![warn(missing_docs, missing_debug_implementations)]
 #![deny(bare_trait_objects)]
 
-mod noop_lock;
-use noop_lock::NoopLock;
+//mod noop_lock;
+//use noop_lock::NoopLock;
+//
+//pub mod buffer;
 
-pub mod buffer;
-
-mod intrusive_singly_linked_list;
 #[allow(dead_code)]
 mod intrusive_double_linked_list;
+mod intrusive_singly_linked_list;
+mod waker;
 
+pub mod chan;
 pub mod sync;
-pub mod channel;
-pub mod timer;
+//pub mod timer;

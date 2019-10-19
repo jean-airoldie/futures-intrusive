@@ -1,11 +1,16 @@
 //! An intrusive single linked list of data
 
-use core::ops::{Deref, DerefMut};
-use core::ptr::null_mut;
-use core::marker::{PhantomPinned};
+use abi_stable::StableAbi;
+
+use core::{
+    marker::PhantomPinned,
+    ops::{Deref, DerefMut},
+    ptr::null_mut,
+};
 
 /// A node which carries data of type `T` and is stored in an intrusive list
-#[derive(Debug)]
+#[derive(Debug, StableAbi)]
+#[repr(C)]
 pub struct ListNode<T> {
     /// The next node in the list. null if there is no previous node.
     next: *mut ListNode<T>,
@@ -16,7 +21,10 @@ pub struct ListNode<T> {
     _pin: PhantomPinned,
 }
 
-impl<T> ListNode<T> {
+impl<T> ListNode<T>
+where
+    T: StableAbi,
+{
     /// Creates a new node with the associated data
     pub fn new(data: T) -> ListNode<T> {
         ListNode::<T> {
@@ -27,7 +35,10 @@ impl<T> ListNode<T> {
     }
 }
 
-impl<T> Deref for ListNode<T> {
+impl<T> Deref for ListNode<T>
+where
+    T: StableAbi,
+{
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -35,7 +46,10 @@ impl<T> Deref for ListNode<T> {
     }
 }
 
-impl<T> DerefMut for ListNode<T> {
+impl<T> DerefMut for ListNode<T>
+where
+    T: StableAbi,
+{
     fn deref_mut(&mut self) -> &mut T {
         &mut self.data
     }
@@ -43,26 +57,29 @@ impl<T> DerefMut for ListNode<T> {
 
 /// An intrusive linked list of nodes, where each node carries associated data
 /// of type `T`.
-#[derive(Debug)]
-pub struct LinkedList<T> {
+#[derive(Debug, StableAbi)]
+#[repr(C)]
+pub struct LinkedList<T>
+where
+    T: StableAbi,
+{
     head: *mut ListNode<T>,
 }
 
-impl<T> LinkedList<T> {
+impl<T> LinkedList<T>
+where
+    T: StableAbi,
+{
     /// Creates an empty linked list
     pub fn new() -> Self {
-        LinkedList::<T> {
-            head: null_mut(),
-        }
+        LinkedList::<T> { head: null_mut() }
     }
 
     /// Consumes the list and creates an iterator over the linked list.
     /// This function is only safe as long as all pointers which are stored inside
     /// the linked list are valid.
     pub unsafe fn into_iter(self) -> LinkedListIterator<T> {
-        LinkedListIterator {
-            current: self.head,
-        }
+        LinkedListIterator { current: self.head }
     }
 
     /// Adds an item to the front of the linked list.
@@ -112,8 +129,7 @@ impl<T> LinkedList<T> {
                     // Remove it from the list and return it.
                     if !prev.is_null() {
                         (*prev).next = null_mut();
-                    }
-                    else {
+                    } else {
                         self.head = null_mut();
                     }
 
@@ -134,9 +150,7 @@ impl<T> LinkedList<T> {
     pub fn take(&mut self) -> LinkedList<T> {
         let head = self.head;
         self.head = null_mut();
-        LinkedList::<T>{
-            head,
-        }
+        LinkedList::<T> { head }
     }
 
     /// Returns whether the linked list does not contain any node
@@ -192,11 +206,17 @@ impl<T> LinkedList<T> {
 }
 
 /// An iterator over an intrusively linked list
-pub struct LinkedListIterator<T> {
+pub struct LinkedListIterator<T>
+where
+    T: StableAbi,
+{
     current: *mut ListNode<T>,
 }
 
-impl<T> Iterator for LinkedListIterator<T> {
+impl<T> Iterator for LinkedListIterator<T>
+where
+    T: StableAbi,
+{
     type Item = *mut ListNode<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -220,7 +240,7 @@ mod tests {
     use super::*;
 
     unsafe fn collect_list<T: Copy>(list: LinkedList<T>) -> Vec<T> {
-        list.into_iter().map(|item|(*(*item).deref())).collect()
+        list.into_iter().map(|item| (*(*item).deref())).collect()
     }
 
     #[test]
@@ -238,7 +258,7 @@ mod tests {
             list.add_front(&mut a);
 
             let items: Vec<i32> = collect_list(list);
-            assert_eq!([5,7,31].to_vec(), items);
+            assert_eq!([5, 7, 31].to_vec(), items);
         }
     }
 
@@ -259,7 +279,7 @@ mod tests {
             let items: Vec<i32> = collect_list(list);
             assert!(items.is_empty());
             let taken_items: Vec<i32> = collect_list(taken);
-            assert_eq!([5,7,31].to_vec(), taken_items);
+            assert_eq!([5, 7, 31].to_vec(), taken_items);
         }
     }
 
@@ -309,7 +329,7 @@ mod tests {
             assert!(c.next.is_null());
 
             let items: Vec<i32> = collect_list(list);
-            assert_eq!([5,7].to_vec(), items);
+            assert_eq!([5, 7].to_vec(), items);
         }
     }
 
