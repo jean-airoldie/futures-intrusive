@@ -66,11 +66,83 @@ fn wakeup_last_receive_waiter(waiters: &mut LinkedList<RecvWaitQueueEntry>) {
     }
 }
 
+/// Wakes up the last waiter and removes it from the wait queue
+fn wakeup_last_send_waiter<T>(waiters: &mut LinkedList<SendWaitQueueEntry<T>>) {
+    let last_waiter = waiters.remove_last();
+
+    if !last_waiter.is_null() {
+        unsafe {
+            (*last_waiter).state = SendPollState::Unregistered;
+
+            if let Some(handle) = (*last_waiter).task.take() {
+                handle.wake();
+            }
+        }
+    }
+}
+
+fn wakeup_n_last_send_waiters<T>(
+    waiters: &mut LinkedList<SendWaitQueueEntry<T>>,
+    n: usize,
+) {
+    for _ in 0..n {
+        wakeup_last_send_waiter(waiters);
+    }
+}
+
+fn wakeup_n_last_receive_waiters(
+    waiters: &mut LinkedList<RecvWaitQueueEntry>,
+    n: usize,
+) {
+    for _ in 0..n {
+        wakeup_last_receive_waiter(waiters);
+    }
+}
+
+struct Capacity {
+    is_blocked: bool,
+    pending: usize,
+}
+
+impl Capacity {
+    fn new() -> Self {
+        Capacity {
+            is_blocked: false,
+            pending: 0,
+        }
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.is_blocked
+    }
+
+    fn block(&mut self, pending: usize) {
+        self.is_blocked = true;
+        self.pending = pending;
+    }
+
+    fn unblock(&mut self) {
+        self.is_blocked = false;
+    }
+
+    fn can_receive(&self) -> bool {
+        !self.is_blocked || self.pending > 0
+    }
+
+    fn decrement(&mut self) {
+        if self.is_blocked {
+            self.pending -= 1;
+        }
+    }
+}
+
 /// Internal state of the channel
 struct ChannelState<T, A>
 where
     A: RingBuf<Item = T>,
 {
+    /// Keeps track of the state and capacity of the channel.
+    capacity: Capacity,
     /// Whether the channel had been closed
     is_closed: bool,
     /// The value which is stored inside the channel
@@ -87,11 +159,27 @@ where
 {
     fn new(buffer: A) -> ChannelState<T, A> {
         ChannelState::<T, A> {
+            capacity: Capacity::new(),
             is_closed: false,
             buffer,
             receive_waiters: LinkedList::new(),
             send_waiters: LinkedList::new(),
         }
+    }
+
+    fn block(&mut self) {
+        self.capacity.block(self.buffer.len());
+    }
+
+    fn unblock(&mut self) {
+        if self.capacity.is_blocked() {
+            let n = self.buffer.capacity() - self.buffer.len();
+
+            // Wakeup the blocked waiters.
+            wakeup_n_last_send_waiters(&mut self.send_waiters, n);
+            wakeup_n_last_receive_waiters(&mut self.receive_waiters, n);
+        }
+        self.capacity.unblock();
     }
 
     fn close(&mut self) {
@@ -117,7 +205,7 @@ where
 
         if self.is_closed {
             Err(TrySendError::Closed(value))
-        } else if self.buffer.can_push() {
+        } else if self.buffer.can_push() && !self.capacity.is_blocked() {
             self.buffer.push(value);
 
             // Wakeup the oldest receive waiter
@@ -147,7 +235,7 @@ where
                     return (Poll::Ready(()), value);
                 }
 
-                if !self.buffer.can_push() {
+                if !self.buffer.can_push() || self.capacity.is_blocked() {
                     // If the capacity is exhausted, register a waiter
                     wait_node.task = Some(cx.waker().clone());
                     wait_node.state = SendPollState::Registered;
@@ -210,7 +298,7 @@ where
     /// Tries to extract a value from the sending waiter which has been waiting
     /// longest on the send operation to complete.
     fn try_take_value_from_sender(&mut self) -> Option<T> {
-        if self.send_waiters.is_empty() {
+        if self.send_waiters.is_empty() || !self.capacity.can_receive() {
             return None;
         }
         // This path should be only used for 0 capacity queues.
@@ -236,8 +324,10 @@ where
 
     /// Tries to receive a value from the channel without waiting.
     fn try_receive(&mut self) -> Result<T, TryReceiveError> {
-        if !self.buffer.is_empty() {
+        if !self.buffer.is_empty() && self.capacity.can_receive() {
             let val = self.buffer.pop();
+
+            self.capacity.decrement();
 
             // Since this means a space in the buffer had been freed,
             // try to copy a value from a potential waiter into the channel.
@@ -455,6 +545,19 @@ where
     /// stored inside the channel. Further attempts will fail.
     pub fn close(&self) {
         self.inner.lock().close()
+    }
+
+    /// Blocks the channel.
+    ///
+    /// While the channel is blocked, it will behave as if it is full
+    /// when sending, but behave normally while receiving.
+    pub fn block(&self) {
+        self.inner.lock().block()
+    }
+
+    /// Unblocks the channel.
+    pub fn unblock(&self) {
+        self.inner.lock().unblock()
     }
 }
 
@@ -832,6 +935,19 @@ mod if_alloc {
             /// stored inside the channel. Further attempts will return `None`.
             pub fn close(&self) {
                 self.inner.channel.close()
+            }
+
+            /// Blocks the channel.
+            ///
+            /// While the channel is blocked, it will behave as if it is full
+            /// when sending, but behave normally while receiving.
+            pub fn block(&self) {
+                self.inner.channel.block()
+            }
+
+            /// Unblocks the channel.
+            pub fn unblock(&self) {
+                self.inner.channel.unblock()
             }
         }
 
