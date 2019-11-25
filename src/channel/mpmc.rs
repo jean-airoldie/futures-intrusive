@@ -537,6 +537,22 @@ where
     future: Option<ChannelReceiveFuture<'a, MutexType, T>>,
 }
 
+impl<'a, MutexType, T, A> tokio::stream::Stream
+    for ChannelStream<'a, MutexType, T, A>
+where
+    A: RingBuf<Item = T>,
+    MutexType: RawMutex,
+{
+    type Item = T;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<Self::Item>> {
+        futures_core::Stream::poll_next(self, cx)
+    }
+}
+
 impl<'a, MutexType, T, A> Stream for ChannelStream<'a, MutexType, T, A>
 where
     A: RingBuf<Item = T>,
@@ -960,6 +976,21 @@ mod if_alloc {
         {
             receiver: Option<GenericReceiver<MutexType, T, A>>,
             future: Option<ChannelReceiveFuture<MutexType, T>>,
+        }
+
+        impl<MutexType, T, A> tokio::stream::Stream for SharedStream<MutexType, T, A>
+        where
+            MutexType: RawMutex,
+            A: 'static + RingBuf<Item = T>,
+        {
+            type Item = T;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                cx: &mut Context,
+            ) -> Poll<Option<Self::Item>> {
+                futures_core::Stream::poll_next(self, cx)
+            }
         }
 
         impl<MutexType, T, A> Stream for SharedStream<MutexType, T, A>
