@@ -985,6 +985,20 @@ mod if_alloc {
             future: Option<ChannelReceiveFuture<MutexType, T>>,
         }
 
+        impl<MutexType, T, A> SharedStream<MutexType, T, A>
+        where
+            MutexType: RawMutex,
+            A: 'static + RingBuf<Item = T>,
+        {
+            /// Closes the channel.
+            /// All pending and future send attempts will fail.
+            /// Receive attempts will continue to succeed as long as there are items
+            /// stored inside the channel. Further attempts will fail.
+            pub fn close(&self) -> CloseStatus {
+                self.receiver.as_ref().unwrap().close()
+            }
+        }
+
         impl<MutexType, T, A> Stream for SharedStream<MutexType, T, A>
         where
             MutexType: RawMutex,
